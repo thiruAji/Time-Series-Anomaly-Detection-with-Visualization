@@ -429,40 +429,59 @@
                 statusEl.style.display = 'block';
                 resultsSummary.className = 'results-summary'; // hide summary
 
-                const response = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
 
-                const data = await response.json();
+                    // Check for HTML response (common on GitHub Pages 404)
+                    const contentType = response.headers.get("content-type");
+                    if (contentType && contentType.indexOf("application/json") === -1) {
+                        throw new Error("Backend not connected. This feature requires running 'python server.py' locally.");
+                    }
 
-                if (data.error) throw new Error(data.error);
+                    if (!response.ok) {
+                        const errData = await response.json();
+                        throw new Error(errData.error || 'Server Error');
+                    }
 
-                // Update UI
-                statusEl.className = 'status success';
-                statusEl.textContent = useAI ? '✅ AI Analysis Complete!' : 'Analysis Complete!';
+                    const data = await response.json();
 
-                // If AI, update y_pred box
-                if (useAI && data.y_pred) {
-                    document.getElementById('y_pred').value = data.y_pred.map(x => x.toFixed(2)).join(', ');
+                    // Update UI
+                    statusEl.className = 'status success';
+                    statusEl.textContent = useAI ? '✅ AI Analysis Complete!' : 'Analysis Complete!';
+
+                    // If AI, update y_pred box
+                    if (useAI && data.y_pred) {
+                        document.getElementById('y_pred').value = data.y_pred.map(x => x.toFixed(2)).join(', ');
+                    }
+
+                    document.getElementById('anomalyCount').textContent = data.count;
+                    document.getElementById('thresholdValue').textContent = data.threshold.toFixed(4);
+                    document.getElementById('maeValue').textContent = data.metrics.mae.toFixed(4);
+                    document.getElementById('rmseValue').textContent = data.metrics.rmse.toFixed(4);
+
+                    resultsSummary.className = 'results-summary show';
+
+                    // Update chart
+                    const chartPred = useAI ? data.y_pred : payload.y_pred;
+                    updateChart(y_true, chartPred, data.anomalies);
+
+                } catch (innerError) {
+                    throw new Error(innerError.message === "Failed to fetch" ? "Backend unreachable. Is 'server.py' running?" : innerError.message);
                 }
-
-                document.getElementById('anomalyCount').textContent = data.count;
-                document.getElementById('thresholdValue').textContent = data.threshold.toFixed(4);
-                document.getElementById('maeValue').textContent = data.metrics.mae.toFixed(4);
-                document.getElementById('rmseValue').textContent = data.metrics.rmse.toFixed(4);
-
-                resultsSummary.className = 'results-summary show';
-
-                // Update chart
-                const chartPred = useAI ? data.y_pred : payload.y_pred;
-                updateChart(y_true, chartPred, data.anomalies);
 
             } catch (error) {
                 console.error(error);
                 statusEl.className = 'status error';
-                statusEl.textContent = error.message;
+                // detailed error message for better user guidance
+                if (error.message.includes("Backend") || error.message.includes("server.py")) {
+                    statusEl.innerHTML = `⚠️ <strong>Backend Offline</strong><br>AI features cannot run on GitHub Pages directly.<br>Please run <code>python server.py</code> on your computer.`;
+                } else {
+                    statusEl.textContent = error.message;
+                }
             }
         }
 

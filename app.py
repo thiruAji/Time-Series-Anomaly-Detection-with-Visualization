@@ -662,28 +662,59 @@ def data_endpoint():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-from nas_search import nas_search
+from nas_search import evolutionary_search, SEARCH_SPACE
 from train import train_and_eval
+from generate_report import generate_nas_report, calculate_anomaly_metrics
+from data_generation import generate_data as generate_synthetic_data, get_ground_truth_labels
 
 @app.route('/train_predict', methods=['POST'])
 def train_predict():
     """
-    1. Receives Actual Data
-    2. Runs NAS to find best model
-    3. Trains model
+    Full NAS Pipeline:
+    1. Receives Actual Data (or generates synthetic 5-feature data)
+    2. Runs Evolutionary NAS to find best model (LSTM/GRU)
+    3. Trains optimal model
     4. Predicts values
     5. Detects Anomalies
+    6. Generates Text Report
     """
     try:
         req_data = request.json
-        y_true = np.array(req_data.get('y_true', []), dtype=float)
+        use_synthetic = req_data.get('use_synthetic', False)
         sigma = float(req_data.get('sigma', 3))
         
-        if len(y_true) < 10:
-            return jsonify({"error": "Need at least 10 data points to train"}), 400
+        # Data preparation
+        if use_synthetic:
+            # Generate 5-feature synthetic data with known anomalies
+            print("📊 Generating 5-feature synthetic dataset...")
+            data_df, ground_truth_anomalies = generate_synthetic_data(n_steps=500, n_features=5)
+            y_true_multi = data_df.values  # Shape: (500, 5)
+            feature_names = list(data_df.columns)
+        else:
+            # Use user-provided data
+            y_true = np.array(req_data.get('y_true', []), dtype=float)
+            
+            if len(y_true) < 10:
+                return jsonify({"error": "Need at least 10 data points to train"}), 400
+            
+            # Convert to multivariate format (5 features via feature engineering)
+            print("📊 Engineering 5 features from input data...")
+            import pandas as pd
+            base = y_true
+            trend = np.gradient(y_true)
+            seasonality = np.sin(2 * np.pi * np.arange(len(y_true)) / max(10, len(y_true)//5))
+            momentum = np.diff(y_true, prepend=y_true[0])
+            volatility = pd.Series(y_true).rolling(window=5, min_periods=1).std().values
+            
+            y_true_multi = np.column_stack([base, trend, seasonality, momentum, volatility])
+            feature_names = ['base', 'trend', 'seasonality', 'momentum', 'volatility']
+            ground_truth_anomalies = np.array([])  # No ground truth for user data
 
-        # Prepare data for LSTM (X=past, y=current)
-        def create_sequences(data, seq_length=3):
+        n_samples, n_features = y_true_multi.shape
+        print(f"   Data shape: {n_samples} samples x {n_features} features")
+
+        # Create sequences for RNN
+        def create_sequences(data, seq_length=5):
             xs, ys = [], []
             for i in range(len(data)-seq_length):
                 x = data[i:i+seq_length]
@@ -692,56 +723,104 @@ def train_predict():
                 ys.append(y)
             return np.array(xs), np.array(ys)
 
-        SEQ_LEN = 3
-        X, y = create_sequences(y_true, SEQ_LEN)
+        SEQ_LEN = 5
+        X, y = create_sequences(y_true_multi, SEQ_LEN)
         
-        # Reshape X for LSTM [samples, time steps, features]
-        # Here we have 1 feature (univariate)
-        X = X.reshape((X.shape[0], X.shape[1], 1))
-        
-        # Split for NAS (simple 80/20 split)
+        # Split for NAS (80/20)
         split = int(len(X) * 0.8)
         X_train, X_val = X[:split], X[split:]
         y_train, y_val = y[:split], y[split:]
         
-        print("🧠 Starting Neural Architecture Search (NAS)...")
-        # Run NAS to find best config
-        best_config, best_score = nas_search(train_and_eval, X_train, y_train, X_val, y_val)
-        print(f"✅ Best config found: {best_config}")
+        print("🧬 Starting Evolutionary Neural Architecture Search...")
+        print(f"   Search Space: {len(SEARCH_SPACE['cell_type'])} cell types × {len(SEARCH_SPACE['num_layers'])} layers × {len(SEARCH_SPACE['hidden_size'])} hidden sizes")
         
-        # Train final model with best config
-        best_layers, best_hidden = best_config
-        model, rmse = train_and_eval(best_layers, best_hidden, X_train, y_train, X_val, y_val, epochs=50)
+        # Run Evolutionary NAS
+        best_config, best_score, search_history, best_model = evolutionary_search(
+            train_and_eval, X_train, y_train, X_val, y_val,
+            population_size=8,
+            generations=4,
+            elite_ratio=0.25,
+            mutation_rate=0.3,
+            verbose=True
+        )
+        
+        print(f"✅ NAS Complete! Best: {best_config['cell_type']}-L{best_config['num_layers']}-H{best_config['hidden_size']}, RMSE: {best_score:.4f}")
         
         # Predict on entire dataset
-        model.eval()
+        best_model.eval()
         with torch.no_grad():
-            full_X_tensor = torch.FloatTensor(X).to(torch.device("cpu")) # CPU for interference
-            if torch.cuda.is_available():
-                model = model.cpu() # Move model to cpu for consistency
-            
-            predictions = model(full_X_tensor).numpy().flatten()
-            
-        # Pad predictions to match original length (first SEQ_LEN points have no prediction)
-        # We assume the first SEQ_LEN predictions are just the actual values (perfect fit) or 0
-        padded_pred = np.concatenate([y_true[:SEQ_LEN], predictions])
+            full_X_tensor = torch.FloatTensor(X).to(torch.device("cpu"))
+            best_model = best_model.cpu()
+            predictions = best_model(full_X_tensor).numpy()
+        
+        # Use first feature (base) for anomaly detection
+        y_true_base = y_true_multi[SEQ_LEN:, 0]
+        y_pred_base = predictions[:, 0]
+        
+        # Pad predictions to match original length
+        padded_pred = np.concatenate([y_true_multi[:SEQ_LEN, 0], y_pred_base])
         
         # Detect Anomalies
-        anomalies, threshold = detect_anomalies(y_true, padded_pred, sigma=sigma)
-        metrics = evaluate_model(y_true, padded_pred)
+        anomalies, threshold = detect_anomalies(y_true_multi[:, 0], padded_pred, sigma=sigma)
+        metrics = evaluate_model(y_true_multi[:, 0], padded_pred)
+        
+        # Calculate precision/recall against ground truth (if available)
+        if len(ground_truth_anomalies) > 0:
+            anomaly_metrics = calculate_anomaly_metrics(anomalies, ground_truth_anomalies, n_samples)
+        else:
+            anomaly_metrics = {'precision': 0, 'recall': 0, 'f1_score': 0, 'true_positives': 0, 'false_positives': len(anomalies), 'false_negatives': 0}
+        
+        # Generate Text Report
+        data_info = {
+            'n_samples': n_samples,
+            'n_features': n_features,
+            'feature_names': feature_names,
+            'n_anomalies': len(ground_truth_anomalies) if len(ground_truth_anomalies) > 0 else 'Unknown',
+            'train_ratio': 0.8
+        }
+        
+        report_path = generate_nas_report(
+            search_history=search_history,
+            best_config=best_config,
+            best_score=best_score,
+            anomaly_metrics=anomaly_metrics,
+            data_info=data_info,
+            output_path="results/nas_report.txt"
+        )
+        print(f"📄 Report saved: {report_path}")
         
         return jsonify({
             "y_pred": padded_pred.tolist(),
             "anomalies": anomalies.tolist(),
+            "count": int(len(anomalies)),
             "threshold": float(threshold),
-            "nas_config": {"layers": best_layers, "hidden": best_hidden},
+            "nas_config": {
+                "cell_type": best_config['cell_type'],
+                "layers": best_config['num_layers'],
+                "hidden": best_config['hidden_size'],
+                "dropout": best_config['dropout'],
+                "learning_rate": best_config['learning_rate']
+            },
             "metrics": {
                 "mae": float(metrics['mae']),
-                "rmse": float(metrics['rmse'])
+                "rmse": float(metrics['rmse']),
+                "val_rmse": float(best_score)
+            },
+            "anomaly_eval": {
+                "precision": float(anomaly_metrics.get('precision', 0)),
+                "recall": float(anomaly_metrics.get('recall', 0)),
+                "f1_score": float(anomaly_metrics.get('f1_score', 0))
+            },
+            "report_path": report_path,
+            "search_summary": {
+                "generations": len(search_history),
+                "configs_evaluated": sum(len(g.get('population_scores', [])) for g in search_history)
             }
         })
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"Error in training: {e}")
         return jsonify({"error": str(e)}), 500
 
