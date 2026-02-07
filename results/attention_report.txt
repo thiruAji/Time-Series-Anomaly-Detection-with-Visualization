@@ -1,0 +1,43 @@
+======================================================================
+           ATTENTION WEIGHT ANALYSIS REPORT
+           Time Series Forecasting with Attention LSTM
+======================================================================
+
+----------------------------------------------------------------------
+1. DATASET INFORMATION
+----------------------------------------------------------------------
+   Samples Analyzed:    100
+   Sequence Length:     7
+
+----------------------------------------------------------------------
+2. ATTENTION STATISTICS
+----------------------------------------------------------------------
+   Peak Attention Step: 6 (weight: 0.3502)
+   Recent Steps Focus:  0.7013
+   Early Steps Focus:   0.1784
+   Mean Entropy:        0.8817 (0=focused, 1=uniform)
+
+----------------------------------------------------------------------
+3. INTERPRETATION
+----------------------------------------------------------------------
+   The model focuses primarily on the most recent time steps, which 
+   is typical for short-term forecasting tasks. Attention is 
+   relatively uniform across time steps, suggesting all historical 
+   data contributes to predictions. Recent time steps receive 
+   significantly more attention than earlier ones, consistent with 
+   typical time series forecasting behavior. 
+
+----------------------------------------------------------------------
+4. MEAN ATTENTION WEIGHTS BY TIME STEP
+----------------------------------------------------------------------
+   Step  0: 0.0506 |##
+   Step  1: 0.0515 |##
+   Step  2: 0.0763 |###
+   Step  3: 0.1203 |######
+   Step  4: 0.1484 |#######
+   Step  5: 0.2028 |##########
+   Step  6: 0.3502 |#################
+
+======================================================================
+                      END OF REPORT
+======================================================================

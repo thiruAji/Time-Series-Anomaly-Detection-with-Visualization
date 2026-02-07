@@ -1,18 +1,19 @@
 # nas_search.py
 """
-Neural Architecture Search using Evolutionary Strategy.
-Searches over: layers, hidden units, cell type (LSTM/GRU), dropout, learning rate.
+Neural Architecture Search for Attention-based LSTM.
+Searches over: layers, hidden units, attention type, attention dimension, dropout, learning rate.
 """
 import numpy as np
 import random
 import copy
 from typing import Dict, List, Tuple, Callable
 
-# Search space definition
+# Search space definition - includes attention parameters
 SEARCH_SPACE = {
     "num_layers": [1, 2, 3],
-    "hidden_size": [32, 64, 128, 256],
-    "cell_type": ["LSTM", "GRU"],
+    "hidden_size": [32, 64, 128],
+    "attention_type": ["bahdanau", "luong"],
+    "attention_dim": [32, 64, 128],
     "dropout": [0.0, 0.1, 0.2, 0.3],
     "learning_rate": [0.001, 0.005, 0.01]
 }
@@ -20,10 +21,12 @@ SEARCH_SPACE = {
 
 def random_config() -> Dict:
     """Generate a random configuration from search space."""
-    return {
+    config = {
         key: random.choice(values)
         for key, values in SEARCH_SPACE.items()
     }
+    config['use_attention'] = True  # Always use attention for NAS
+    return config
 
 
 def mutate_config(config: Dict, mutation_rate: float = 0.3) -> Dict:
@@ -37,7 +40,7 @@ def mutate_config(config: Dict, mutation_rate: float = 0.3) -> Dict:
 
 def crossover(parent1: Dict, parent2: Dict) -> Dict:
     """Create child configuration by crossing over two parents."""
-    child = {}
+    child = {'use_attention': True}
     for key in SEARCH_SPACE:
         child[key] = random.choice([parent1[key], parent2[key]])
     return child
@@ -54,9 +57,9 @@ def evolutionary_search(
     elite_ratio: float = 0.2,
     mutation_rate: float = 0.3,
     verbose: bool = True
-) -> Tuple[Dict, float, List[Dict]]:
+) -> Tuple[Dict, float, List[Dict], object]:
     """
-    Evolutionary Neural Architecture Search.
+    Evolutionary Neural Architecture Search for Attention LSTM.
     
     Args:
         train_fn: Training function(config, X_train, y_train, X_val, y_val) -> (model, rmse)
@@ -68,7 +71,7 @@ def evolutionary_search(
         verbose: Print progress
     
     Returns:
-        Tuple of (best_config, best_score, search_history)
+        Tuple of (best_config, best_score, search_history, best_model)
     """
     history = []
     
@@ -91,7 +94,8 @@ def evolutionary_search(
                 scores.append((config, rmse, model))
                 
                 if verbose:
-                    print(f"  [{i+1}/{len(population)}] {config['cell_type']}-L{config['num_layers']}-H{config['hidden_size']} -> RMSE: {rmse:.4f}")
+                    attention_str = f"{config['attention_type'][:4].upper()}"
+                    print(f"  [{i+1}/{len(population)}] L{config['num_layers']}-H{config['hidden_size']}-{attention_str}-A{config['attention_dim']} RMSE: {rmse:.4f}")
                 
                 # Track best
                 if rmse < best_score:
@@ -99,7 +103,7 @@ def evolutionary_search(
                     best_config = config
                     best_model = model
                     if verbose:
-                        print(f"    *** New best! ***")
+                        print(f"    [New best]")
                         
             except Exception as e:
                 if verbose:
@@ -138,7 +142,8 @@ def evolutionary_search(
     
     if verbose:
         print(f"\n=== Search Complete ===")
-        print(f"Best Config: {best_config}")
+        print(f"Best Attention Type: {best_config['attention_type']}")
+        print(f"Best Config: L{best_config['num_layers']}-H{best_config['hidden_size']}-A{best_config['attention_dim']}")
         print(f"Best RMSE: {best_score:.4f}")
     
     return best_config, best_score, history, best_model
@@ -153,12 +158,13 @@ def nas_search(train_fn, X_train, y_train, X_val, y_val):
         generations=3,
         verbose=True
     )
-    # Return in legacy format (tuple of key values)
+    # Return in legacy format
     return (best_config['num_layers'], best_config['hidden_size']), best_score
 
 
 if __name__ == "__main__":
-    print("NAS Search Space:")
+    print("NAS Search Space for Attention LSTM:")
     for key, values in SEARCH_SPACE.items():
         print(f"  {key}: {values}")
-    print(f"\nTotal configurations: {np.prod([len(v) for v in SEARCH_SPACE.values()])}")
+    total = np.prod([len(v) for v in SEARCH_SPACE.values()])
+    print(f"\nTotal configurations: {total}")

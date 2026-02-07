@@ -1,66 +1,81 @@
 # train.py
 """
-Training module for RNN models with configurable hyperparameters.
+Training module for Attention-based LSTM with walk-forward cross-validation.
+Supports both attention and baseline models for comparison.
 """
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
-from model import RNNModel
+from model import AttentionLSTM, BaselineLSTM
 
-def train_and_eval(config, X_train, y_train, X_val, y_val, epochs=30):
+
+def walk_forward_split(X, y, n_splits=5, test_size=0.2):
     """
-    Train and evaluate an RNN model with given configuration.
+    Generate walk-forward cross-validation splits for time series.
+    
+    Unlike standard k-fold, this ensures training data always precedes test data,
+    which is critical for time series to prevent data leakage.
     
     Args:
-        config: Dict with keys: num_layers, hidden_size, cell_type, dropout, learning_rate
-               OR legacy format: (layers, hidden) tuple
+        X, y: Full dataset
+        n_splits: Number of validation folds
+        test_size: Fraction of data to use as test in each split
+    
+    Yields:
+        (X_train, y_train, X_val, y_val) for each split
+    """
+    n_samples = len(X)
+    test_samples = int(n_samples * test_size)
+    
+    for i in range(n_splits):
+        # Calculate split points
+        # Each fold uses progressively more training data
+        train_end = int(n_samples * (0.5 + i * 0.1))  # Start at 50%, grow by 10% each fold
+        train_end = min(train_end, n_samples - test_samples)
+        
+        val_start = train_end
+        val_end = min(val_start + test_samples, n_samples)
+        
+        if val_start >= val_end or train_end <= 0:
+            continue
+        
+        X_train = X[:train_end]
+        y_train = y[:train_end]
+        X_val = X[val_start:val_end]
+        y_val = y[val_start:val_end]
+        
+        yield X_train, y_train, X_val, y_val
+
+
+def train_model(model, X_train, y_train, epochs=30, batch_size=32, lr=0.001):
+    """
+    Train a model on given data.
+    
+    Args:
+        model: PyTorch model
         X_train, y_train: Training data
-        X_val, y_val: Validation data
         epochs: Number of training epochs
+        batch_size: Batch size
+        lr: Learning rate
     
     Returns:
-        Tuple of (trained_model, validation_rmse)
+        Trained model, list of epoch losses
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Handle legacy format
-    if isinstance(config, tuple):
-        layers, hidden = config
-        config = {
-            'num_layers': layers,
-            'hidden_size': hidden,
-            'cell_type': 'LSTM',
-            'dropout': 0.2,
-            'learning_rate': 0.001
-        }
-    
-    # Determine input size from data shape (samples, seq_len, features)
-    input_size = X_train.shape[2] if len(X_train.shape) == 3 else 1
-    
-    # Build model
-    model = RNNModel(
-        input_size=input_size,
-        hidden_size=config['hidden_size'],
-        num_layers=config['num_layers'],
-        cell_type=config.get('cell_type', 'LSTM'),
-        dropout=config.get('dropout', 0.2)
-    ).to(device)
+    model = model.to(device)
     
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(
-        model.parameters(), 
-        lr=config.get('learning_rate', 0.001)
-    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # Prepare data loaders
     train_dataset = TensorDataset(
         torch.FloatTensor(X_train),
         torch.FloatTensor(y_train)
     )
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     
-    # Training loop
+    losses = []
+    
     model.train()
     for epoch in range(epochs):
         epoch_loss = 0
@@ -70,7 +85,7 @@ def train_and_eval(config, X_train, y_train, X_val, y_val, epochs=30):
             optimizer.zero_grad()
             outputs = model(X_batch)
             
-            # Handle output shape
+            # Handle shape mismatch
             if outputs.shape != y_batch.shape:
                 if len(y_batch.shape) == 1:
                     outputs = outputs.squeeze()
@@ -81,33 +96,155 @@ def train_and_eval(config, X_train, y_train, X_val, y_val, epochs=30):
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+        
+        losses.append(epoch_loss / len(train_loader))
     
-    # Validation
+    return model, losses
+
+
+def evaluate_model(model, X_val, y_val):
+    """
+    Evaluate model on validation data.
+    
+    Returns:
+        dict with rmse, mae, predictions
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
     model.eval()
+    
     with torch.no_grad():
         X_val_t = torch.FloatTensor(X_val).to(device)
         y_val_t = torch.FloatTensor(y_val).to(device)
         
-        val_outputs = model(X_val_t)
+        predictions = model(X_val_t)
         
-        # Handle output shape
-        if val_outputs.shape != y_val_t.shape:
+        # Handle shape
+        if predictions.shape != y_val_t.shape:
             if len(y_val_t.shape) == 1:
-                val_outputs = val_outputs.squeeze()
-            elif val_outputs.shape[-1] != y_val_t.shape[-1]:
-                val_outputs = val_outputs[:, :y_val_t.shape[-1]]
+                predictions = predictions.squeeze()
         
-        val_loss = criterion(val_outputs, y_val_t)
-        rmse = np.sqrt(val_loss.cpu().item())
+        mse = nn.MSELoss()(predictions, y_val_t).item()
+        rmse = np.sqrt(mse)
+        mae = torch.mean(torch.abs(predictions - y_val_t)).item()
     
-    return model, rmse
+    return {
+        'rmse': rmse,
+        'mae': mae,
+        'predictions': predictions.cpu().numpy()
+    }
+
+
+def train_and_eval(config, X_train, y_train, X_val, y_val, epochs=30):
+    """
+    Train and evaluate model with given configuration.
+    
+    Args:
+        config: Dict with model configuration OR legacy tuple (layers, hidden)
+        X_train, y_train, X_val, y_val: Data splits
+        epochs: Training epochs
+    
+    Returns:
+        (model, rmse)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Handle legacy format
+    if isinstance(config, tuple):
+        layers, hidden = config
+        config = {
+            'num_layers': layers,
+            'hidden_size': hidden,
+            'attention_type': 'bahdanau',
+            'attention_dim': 64,
+            'dropout': 0.2,
+            'learning_rate': 0.001,
+            'use_attention': True
+        }
+    
+    # Determine input size
+    input_size = X_train.shape[2] if len(X_train.shape) == 3 else 1
+    
+    # Build model (attention or baseline)
+    if config.get('use_attention', True):
+        model = AttentionLSTM(
+            input_size=input_size,
+            hidden_size=config['hidden_size'],
+            num_layers=config['num_layers'],
+            attention_type=config.get('attention_type', 'bahdanau'),
+            attention_dim=config.get('attention_dim', 64),
+            dropout=config.get('dropout', 0.2)
+        ).to(device)
+    else:
+        model = BaselineLSTM(
+            input_size=input_size,
+            hidden_size=config['hidden_size'],
+            num_layers=config['num_layers'],
+            dropout=config.get('dropout', 0.2)
+        ).to(device)
+    
+    # Train
+    model, losses = train_model(
+        model, X_train, y_train,
+        epochs=epochs,
+        lr=config.get('learning_rate', 0.001)
+    )
+    
+    # Evaluate
+    metrics = evaluate_model(model, X_val, y_val)
+    
+    return model, metrics['rmse']
+
+
+def compare_attention_vs_baseline(X_train, y_train, X_val, y_val, hidden_size=64, num_layers=2):
+    """
+    Compare Attention LSTM against Baseline LSTM.
+    
+    Returns:
+        dict with comparison results
+    """
+    input_size = X_train.shape[2]
+    
+    # Train Baseline
+    print("Training Baseline LSTM (no attention)...")
+    baseline_config = {
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'use_attention': False,
+        'dropout': 0.2,
+        'learning_rate': 0.001
+    }
+    baseline_model, baseline_rmse = train_and_eval(baseline_config, X_train, y_train, X_val, y_val)
+    
+    # Train Attention LSTM
+    print("Training Attention LSTM (Bahdanau)...")
+    attention_config = {
+        'hidden_size': hidden_size,
+        'num_layers': num_layers,
+        'use_attention': True,
+        'attention_type': 'bahdanau',
+        'attention_dim': 64,
+        'dropout': 0.2,
+        'learning_rate': 0.001
+    }
+    attention_model, attention_rmse = train_and_eval(attention_config, X_train, y_train, X_val, y_val)
+    
+    improvement = ((baseline_rmse - attention_rmse) / baseline_rmse) * 100
+    
+    return {
+        'baseline_rmse': baseline_rmse,
+        'attention_rmse': attention_rmse,
+        'improvement_percent': improvement,
+        'attention_model': attention_model,
+        'baseline_model': baseline_model
+    }
 
 
 if __name__ == "__main__":
-    # Quick test
     from data_generation import generate_data
     
-    data, anomalies = generate_data(n_steps=200)
+    # Generate test data
+    data, anomalies = generate_data(n_steps=300)
     X = data.values[:-1].reshape(-1, 1, 5)
     y = data.values[1:]
     
@@ -115,13 +252,10 @@ if __name__ == "__main__":
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
     
-    config = {
-        'num_layers': 2,
-        'hidden_size': 64,
-        'cell_type': 'GRU',
-        'dropout': 0.1,
-        'learning_rate': 0.005
-    }
+    # Compare models
+    results = compare_attention_vs_baseline(X_train, y_train, X_val, y_val)
     
-    model, rmse = train_and_eval(config, X_train, y_train, X_val, y_val)
-    print(f"Test RMSE: {rmse:.4f}")
+    print(f"\nResults:")
+    print(f"  Baseline LSTM RMSE: {results['baseline_rmse']:.4f}")
+    print(f"  Attention LSTM RMSE: {results['attention_rmse']:.4f}")
+    print(f"  Improvement: {results['improvement_percent']:.2f}%")
